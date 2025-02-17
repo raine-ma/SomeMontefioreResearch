@@ -1,0 +1,136 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+
+db_path = r'F:\AllMontefiore2024August.sqlite'
+depression_file_path = r'F:\Raine\depression conditions.csv'
+visit_files = [
+    r'F:\Roham\BC Pandemic (with Hasan)\telehealth.csv',
+    r'F:\Roham\BC Pandemic (with Hasan)\outpatient.csv',
+    r'F:\Roham\BC Pandemic (with Hasan)\office visit.csv',
+    r'F:\Roham\BC Pandemic (with Hasan)\inpatient.csv'
+]
+demographic_category = 'GENDER'  
+demographic_values = ['Male', 'Female']  
+
+dep_data = pd.read_csv(depression_file_path, parse_dates=['CONDITION_START_DATE'], dayfirst=True)
+dep_data.dropna(subset=['PERSON_ID', 'CONDITION_START_DATE'], inplace=True)
+dep_data = dep_data[dep_data['CONDITION_START_DATE'] >= '2018-01-01']
+dep_data['Month'] = dep_data['CONDITION_START_DATE'].dt.to_period('M')
+
+visit_data_list = []
+for file in visit_files:
+    df = pd.read_csv(file, parse_dates=['VISIT_START_DATE'], dayfirst=True)
+    df.dropna(subset=['PERSON_ID', 'VISIT_START_DATE'], inplace=True)
+    df = df[df['VISIT_START_DATE'] >= '2018-01-01']
+    df['Month'] = df['VISIT_START_DATE'].dt.to_period('M')
+    visit_data_list.append(df)
+
+visit_data = pd.concat(visit_data_list, ignore_index=True)
+
+conn = sqlite3.connect(db_path)
+
+if demographic_category == 'GENDER':
+    concept_id_field = 'GENDER_CONCEPT_ID'
+elif demographic_category == 'RACE':
+    concept_id_field = 'RACE_CONCEPT_ID'
+elif demographic_category == 'ETHNICITY':
+    concept_id_field = 'ETHNICITY_CONCEPT_ID'
+else:
+    raise ValueError("Invalid demographic category. Must be 'GENDER', 'RACE', or 'ETHNICITY'.")
+
+concept_query = f"""
+    SELECT CONCEPT_ID, CONCEPT_NAME
+    FROM Concept
+    WHERE CONCEPT_ID IN (
+        SELECT DISTINCT {concept_id_field}
+        FROM Person
+    )
+"""
+concepts_df = pd.read_sql(concept_query, conn)
+id_to_category = dict(zip(concepts_df['CONCEPT_ID'], concepts_df['CONCEPT_NAME']))
+
+person_query = f"""
+    SELECT PERSON_ID, {concept_id_field}
+    FROM Person
+"""
+person_demo_df = pd.read_sql(person_query, conn)
+conn.close()
+
+person_demo_df[demographic_category] = person_demo_df[concept_id_field].map(id_to_category)
+demo_map = dict(zip(person_demo_df['PERSON_ID'], person_demo_df[demographic_category]))
+
+dep_data[demographic_category] = dep_data['PERSON_ID'].map(demo_map)
+visit_data[demographic_category] = visit_data['PERSON_ID'].map(demo_map)
+
+dep_counts = (
+    dep_data
+    .groupby(['Month', demographic_category])['PERSON_ID']
+    .nunique()  
+    .reset_index(name='Unique_Dep_Visits')
+)
+
+visit_counts = (
+    visit_data
+    .groupby(['Month', demographic_category])['PERSON_ID']
+    .nunique()  
+    .reset_index(name='Unique_Total_Visits')
+)
+
+relprev_df = pd.merge(dep_counts, visit_counts, on=['Month', demographic_category], how='outer')
+
+relprev_df['Relative Prevalence'] = (
+    relprev_df['Unique_Dep_Visits'] / relprev_df['Unique_Total_Visits']
+).fillna(0)
+
+relprev_pivot = relprev_df.pivot(index='Month', columns=demographic_category, values='Relative Prevalence').reset_index()
+
+for val in demographic_values:
+    if val not in relprev_pivot.columns:
+        relprev_pivot[val] = 0
+
+relprev_pivot['Month'] = relprev_pivot['Month'].dt.to_timestamp()
+
+sns.set(style="whitegrid", context="talk")
+plt.figure(figsize=(16, 8))
+
+for val in demographic_values:
+    sns.lineplot(
+        data=relprev_pivot,
+        x='Month',
+        y=val,
+        marker='o',
+        linewidth=2.5,
+        label=f'Relative Prevalence ({val})'
+    )
+
+baseline = relprev_pivot[relprev_pivot['Month'] < '2020-01-01']
+
+import numpy as np
+for val in demographic_values:
+    mean_val = baseline[val].mean() if not baseline.empty else 0
+    std_err = baseline[val].std() / np.sqrt(len(baseline)) if not baseline.empty else 0
+    ci_value = 1.96 * std_err
+    plt.axhline(mean_val, linestyle='--', linewidth=2, label=f'{val} Mean (2018-19)')
+    plt.fill_between(
+        relprev_pivot['Month'],
+        mean_val - ci_value,
+        mean_val + ci_value,
+        alpha=0.2,
+        label=f'{val} 95% CI (Rel. to 2018-19)'
+    )
+
+plt.title(f'Relative Prevalence of Depression (Unique) by {demographic_category} (From 2018)', 
+          fontsize=18, weight='bold', pad=20)
+plt.xlabel('Month', fontsize=14, labelpad=15)
+plt.ylabel('Relative Prevalence (Unique Dep Visits / Unique Total Visits)', fontsize=14, labelpad=15)
+max_val = relprev_pivot[demographic_values].max().max()
+plt.ylim(0, max_val * 1.1 if max_val > 0 else 1)
+plt.xticks(rotation=45, fontsize=12)
+plt.yticks(fontsize=12)
+plt.legend(fontsize=12, frameon=False, loc='upper left')
+sns.despine()
+plt.tight_layout()
+plt.show()
